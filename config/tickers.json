@@ -1,0 +1,5 @@
+{
+  "tickers": ["EZJ.L", "RYAAY", "JET2.L", "WIZZ.L"],
+  "db_path": "data/market_data.duckdb",
+  "period": "6mo"
+}
