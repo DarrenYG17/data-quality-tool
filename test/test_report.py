@@ -13,7 +13,7 @@ import pandas as pd
 
 from src.explain import _EXPLANATIONS_SCHEMA
 from src.ingest import _TABLE_SCHEMA
-from src.report import build_report, save_report
+from src.report import build_report, default_report_filename, save_report
 from src.validate import _FLAGS_SCHEMA
 
 
@@ -173,3 +173,54 @@ class TestReport:
 
         assert output_path.exists()
         assert output_path.read_text(encoding="utf-8") == "# Test Report\n\nHello."
+
+    def test_default_report_filename_matches_for_identical_scope(self, tmp_path):
+        """Two databases covering the same tickers and date range should hash to the same filename."""
+        days = _weekdays(date(2026, 1, 5), 3)
+
+        db_path_a = tmp_path / "a.duckdb"
+        _setup_db(db_path_a, [_make_price_row("AAA", "NYSE", d, 10 + i) for i, d in enumerate(days)], [])
+
+        db_path_b = tmp_path / "b.duckdb"
+        _setup_db(db_path_b, [_make_price_row("AAA", "NYSE", d, 99 + i) for i, d in enumerate(days)], [])
+
+        report_date = date(2026, 7, 27)
+        assert default_report_filename(db_path_a, report_date) == default_report_filename(db_path_b, report_date)
+
+    def test_default_report_filename_differs_for_different_tickers(self, tmp_path):
+        """A different ticker set covering the same date range should hash to a different filename."""
+        days = _weekdays(date(2026, 1, 5), 3)
+
+        db_path_a = tmp_path / "a.duckdb"
+        _setup_db(db_path_a, [_make_price_row("AAA", "NYSE", d, 10 + i) for i, d in enumerate(days)], [])
+
+        db_path_b = tmp_path / "b.duckdb"
+        _setup_db(db_path_b, [_make_price_row("BBB", "NYSE", d, 10 + i) for i, d in enumerate(days)], [])
+
+        report_date = date(2026, 7, 27)
+        assert default_report_filename(db_path_a, report_date) != default_report_filename(db_path_b, report_date)
+
+    def test_default_report_filename_differs_for_different_date_range(self, tmp_path):
+        """The same ticker over a different date range should hash to a different filename."""
+        days_a = _weekdays(date(2026, 1, 5), 3)
+        days_b = _weekdays(date(2026, 2, 2), 3)
+
+        db_path_a = tmp_path / "a.duckdb"
+        _setup_db(db_path_a, [_make_price_row("AAA", "NYSE", d, 10 + i) for i, d in enumerate(days_a)], [])
+
+        db_path_b = tmp_path / "b.duckdb"
+        _setup_db(db_path_b, [_make_price_row("AAA", "NYSE", d, 10 + i) for i, d in enumerate(days_b)], [])
+
+        report_date = date(2026, 7, 27)
+        assert default_report_filename(db_path_a, report_date) != default_report_filename(db_path_b, report_date)
+
+    def test_default_report_filename_includes_report_date(self, tmp_path):
+        """The filename should embed the given report_date regardless of the data's own date range."""
+        db_path = tmp_path / "a.duckdb"
+        days = _weekdays(date(2026, 1, 5), 3)
+        _setup_db(db_path, [_make_price_row("AAA", "NYSE", d, 10 + i) for i, d in enumerate(days)], [])
+
+        filename = default_report_filename(db_path, date(2026, 12, 25))
+
+        assert filename.startswith("market_data_quality_report_2026-12-25_")
+        assert filename.endswith(".md")

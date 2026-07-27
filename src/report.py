@@ -5,9 +5,10 @@ single human-readable report: an overall summary, a per-ticker breakdown of
 every flag in chronological order, and a closing pass-rate figure.
 """
 
+import hashlib
 from datetime import date
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import duckdb
 import pandas as pd
@@ -133,8 +134,37 @@ def save_report(report: str, path: Union[str, Path]) -> None:
     path.write_text(report, encoding="utf-8")
 
 
+def _ticker_date_range_hash(con: duckdb.DuckDBPyConnection) -> str:
+    """Short hash derived from the ticker set and date range covered by `prices`.
+
+    Two reports covering the same tickers and date range hash identically
+    (and share a filename, so an identical rerun just overwrites); a
+    different scope (different tickers or date range) hashes differently,
+    so those reports get distinct filenames instead of colliding.
+    """
+    tickers = con.execute("SELECT DISTINCT ticker FROM prices ORDER BY ticker").fetchdf()["ticker"].tolist()
+    min_date, max_date = con.execute("SELECT MIN(date), MAX(date) FROM prices").fetchone()
+    basis = f"{','.join(tickers)}|{min_date}|{max_date}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:8]
+
+
+def default_report_filename(
+    db_path: Union[str, Path] = DEFAULT_DB_PATH,
+    report_date: Optional[date] = None,
+) -> str:
+    """Build the default report filename: market_data_quality_report_<date>_<hash>.md."""
+    report_date = report_date or date.today()
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        content_hash = _ticker_date_range_hash(con)
+    finally:
+        con.close()
+
+    return f"market_data_quality_report_{report_date.isoformat()}_{content_hash}.md"
+
+
 if __name__ == "__main__":
     report = build_report()
-    output_path = DEFAULT_REPORTS_DIR / f"report_{date.today().isoformat()}.md"
+    output_path = DEFAULT_REPORTS_DIR / default_report_filename()
     save_report(report, output_path)
     print(f"Report written to {output_path}")

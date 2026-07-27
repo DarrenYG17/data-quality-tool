@@ -7,6 +7,7 @@ import duckdb
 
 from src.explain import run_explanations
 from src.ingest import DEFAULT_CONFIG_PATH, TickerDataUnavailable, load_config, run
+from src.report import DEFAULT_REPORTS_DIR, build_report, default_report_filename, save_report
 from src.validate import run_validations
 
 
@@ -103,6 +104,16 @@ def main() -> int:
         return 1
 
     print_explanation_summary(explanation_summary)
+
+    try:
+        report = build_report(db_path)
+        report_path = DEFAULT_REPORTS_DIR / default_report_filename(db_path)
+        save_report(report, report_path)
+    except (duckdb.Error, OSError) as exc:
+        print(f"Report generation failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"\nReport written to {report_path}")
     return 0
 
 
