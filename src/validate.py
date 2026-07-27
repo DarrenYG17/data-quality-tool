@@ -31,25 +31,22 @@ CREATE TABLE flags (
 
 
 def _empty_flags() -> pd.DataFrame:
+    """
+    Build an empty, correctly-columned flags DataFrame.
+
+    @return: An empty DataFrame with columns [ticker, date, flag_type, severity, details].
+    """
     return pd.DataFrame(columns=_FLAGS_COLUMNS)
 
 
 def check_missing_dates(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Flag expected trading days with no price row at all.
+    """
+    Flag expected trading days that have no price row at all.
 
-    For each ticker, looks up its own exchange's trading calendar (via
-    pandas_market_calendars) and computes the actual trading days between
-    that ticker's min and max date in `prices`, then flags any of those
-    days with no matching row. A date that wasn't a trading day for the
-    ticker's exchange (weekend or market holiday) is never flagged.
-
-    Why it matters: a missing trading day is an incomplete/broken data
-    pull, not a benign calendar artifact — unlike a naive "every weekday"
-    check, this won't misflag real market holidays as gaps. Severity
-    defaults to LOW since a single missed day is rarely a crisis, but it's
-    still a hole that will silently distort anything computed over "all
-    trading days" (rolling averages, return series, etc.) unless it's
-    accounted for.
+    @param con: Open DuckDB connection with a `prices` table containing
+        (ticker, exchange, date, ...) rows.
+    @return: A flags DataFrame (possibly empty) with one row per missing
+        trading day, flag_type "MISSING_DATES", severity "low".
     """
     ticker_bounds = con.execute(
         """
@@ -70,6 +67,8 @@ def check_missing_dates(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 
     rows = []
     for row in ticker_bounds.itertuples():
+        # Each ticker gets its own exchange's real trading calendar (not a naive
+        # "every weekday" assumption), so a market holiday is never misflagged as a gap.
         calendar = mcal.get_calendar(row.exchange)
         trading_days = calendar.valid_days(start_date=row.min_date, end_date=row.max_date)
         expected_dates = {ts.date() for ts in trading_days}
@@ -87,6 +86,9 @@ def check_missing_dates(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     # in run_validations() ends up with a mixed-type object column.
     df["date"] = pd.to_datetime(df["date"])
     df["flag_type"] = "MISSING_DATES"
+    # LOW: most gaps turn out to be routine holidays that slipped past the
+    # calendar check (or a single incomplete pull) rather than pipeline failures —
+    # this is about visibility, not alarm.
     df["severity"] = "low"
     df["details"] = df["date"].apply(
         lambda d: f"No price row found for expected trading day {d.date()}."
@@ -95,18 +97,14 @@ def check_missing_dates(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 
 
 def check_stale_price(con: duckdb.DuckDBPyConnection, n: int = 3) -> pd.DataFrame:
-    """Flag dates where `close` has been unchanged for N+1 consecutive trading days.
+    """
+    Flag dates where `close` has been unchanged for more than n consecutive trading days.
 
-    Uses a gaps-and-islands pattern: a running counter increments every time
-    `close` changes from the previous day, forming groups ("streaks") of
-    consecutive equal closes, then flags rows whose streak length exceeds N.
-
-    Why it matters: a close price that stops moving for several sessions in
-    a row is unusual for a liquid, actively-traded name and often signals a
-    stale or repeated data pull (e.g. yfinance re-serving the last known
-    price) rather than genuine market behavior. Severity defaults to MEDIUM
-    — worth investigating, but low-volume tickers can legitimately go flat
-    for a few days around holidays or thin trading.
+    @param con: Open DuckDB connection with a `prices` table.
+    @param n: Streak-length threshold; a row is flagged once its run of
+        identical consecutive closes exceeds n.
+    @return: A flags DataFrame (possibly empty), flag_type "STALE_PRICE",
+        severity "medium".
     """
     n = int(n)
     query = f"""
@@ -116,6 +114,8 @@ def check_stale_price(con: duckdb.DuckDBPyConnection, n: int = 3) -> pd.DataFram
             FROM prices
         ),
         grouped AS (
+            -- Gaps-and-islands trick: increment a running counter every time close
+            -- actually changes, so all rows sharing a value form one "streak_id" group.
             SELECT *,
                    SUM(CASE WHEN prev_close IS NULL OR close != prev_close THEN 1 ELSE 0 END)
                        OVER (PARTITION BY ticker ORDER BY date
@@ -138,6 +138,9 @@ def check_stale_price(con: duckdb.DuckDBPyConnection, n: int = 3) -> pd.DataFram
         return _empty_flags()
 
     df["flag_type"] = "STALE_PRICE"
+    # MEDIUM: unusual for a liquid, actively-traded name and often signals a
+    # stale/repeated data pull, but low-volume tickers can legitimately go flat
+    # for a few days around holidays or thin trading.
     df["severity"] = "medium"
     df["details"] = df.apply(
         lambda r: (
@@ -150,20 +153,14 @@ def check_stale_price(con: duckdb.DuckDBPyConnection, n: int = 3) -> pd.DataFram
 
 
 def check_outlier_return(con: duckdb.DuckDBPyConnection, k: float = 3.0) -> pd.DataFrame:
-    """Flag daily returns that deviate from a ticker's trailing 30-day mean by more than k std devs.
+    """
+    Flag daily returns that deviate from a ticker's own trailing 30-day mean by more than k std devs.
 
-    Computes the daily percentage return on `adj_close`, then a trailing
-    30-day rolling mean/stddev (excluding the current day) via SQL window
-    functions, and flags days where the return falls more than k standard
-    deviations from that rolling mean.
-
-    Why it matters: airline/travel stocks are already volatile, but a return
-    that's a genuine statistical outlier relative to the ticker's own recent
-    behavior is worth a second look — it can be a bad print in the feed, an
-    unadjusted split/dividend, or real news (fine, but still worth
-    surfacing). Severity defaults to MEDIUM since large moves are often
-    legitimate for this sector; tighten k if false positives are too
-    frequent.
+    @param con: Open DuckDB connection with a `prices` table.
+    @param k: Number of standard deviations from the trailing rolling mean
+        beyond which a day's return is considered an outlier.
+    @return: A flags DataFrame (possibly empty), flag_type "OUTLIER_RETURN",
+        severity "medium".
     """
     k = float(k)
     query = f"""
@@ -174,6 +171,8 @@ def check_outlier_return(con: duckdb.DuckDBPyConnection, k: float = 3.0) -> pd.D
             FROM prices
         ),
         rolling AS (
+            -- "30 PRECEDING AND 1 PRECEDING" excludes the current day itself, so today's
+            -- return is judged against the ticker's own recent history, not against itself.
             SELECT ticker, date, pct_return,
                    AVG(pct_return) OVER (
                        PARTITION BY ticker ORDER BY date
@@ -197,6 +196,8 @@ def check_outlier_return(con: duckdb.DuckDBPyConnection, k: float = 3.0) -> pd.D
         return _empty_flags()
 
     df["flag_type"] = "OUTLIER_RETURN"
+    # MEDIUM: airline/travel stocks are already volatile, so a large move is often
+    # legitimate news rather than a data error; tighten k if false positives pile up.
     df["severity"] = "medium"
     df["z_score"] = (df["pct_return"] - df["rolling_mean"]) / df["rolling_std"]
     df["details"] = df.apply(
@@ -211,7 +212,8 @@ def check_outlier_return(con: duckdb.DuckDBPyConnection, k: float = 3.0) -> pd.D
 
 
 def check_duplicate_rows(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Flag (ticker, date) combinations that appear more than once in `prices`.
+    """
+    Flag (ticker, date) combinations that appear more than once in `prices`.
 
     Note: with the current ingest.py, `prices` has a PRIMARY KEY (ticker,
     date) constraint, so a true duplicate can never actually be inserted —
@@ -219,11 +221,9 @@ def check_duplicate_rows(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     write_to_duckdb(). It's kept as a safeguard in case `prices` is ever
     populated by another path that doesn't enforce that constraint.
 
-    Why it matters: this table should have exactly one row per ticker per
-    trading day. Duplicates usually mean the ingestion job re-ran without
-    deduping (or a join fanned out upstream) and will silently double-count
-    volume and skew any aggregation. Severity defaults to HIGH — this is a
-    structural data integrity problem, not a market observation.
+    @param con: Open DuckDB connection with a `prices` table.
+    @return: A flags DataFrame (possibly empty), flag_type "DUPLICATE_ROW",
+        severity "high".
     """
     query = """
         SELECT ticker, date, COUNT(*) AS occurrences
@@ -237,6 +237,8 @@ def check_duplicate_rows(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         return _empty_flags()
 
     df["flag_type"] = "DUPLICATE_ROW"
+    # HIGH: this table should have exactly one row per ticker per trading day;
+    # duplicates silently double-count volume and skew any aggregation.
     df["severity"] = "high"
     df["details"] = df["occurrences"].apply(
         lambda c: f"{int(c)} duplicate rows found for this ticker/date combination"
@@ -245,18 +247,16 @@ def check_duplicate_rows(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 
 
 def check_ohlc_inconsistency(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Flag rows where the OHLC values are internally impossible.
-
-    The high must be >= every other price in the session and the low must
-    be <= every other price; this checks for high < low/open/close or
-    low > open/close.
-
-    Why it matters: a violation means the row is corrupted at the source
-    (bad feed data, or a bad join/merge during ingestion) rather than
-    reflecting real market behavior. Severity defaults to HIGH — any
-    calculation built on these rows (returns, ranges, volatility) will be
-    wrong.
     """
+    Flag rows where the OHLC values are internally impossible.
+
+    @param con: Open DuckDB connection with a `prices` table.
+    @return: A flags DataFrame (possibly empty), flag_type "OHLC_INCONSISTENCY",
+        severity "high", with `details` listing every specific violation found
+        (a row can fail more than one condition at once).
+    """
+    # high must be >= every other price in the session and low must be <= every
+    # other price; any violation of that means the row is internally impossible.
     query = """
         SELECT ticker, date, open, high, low, close
         FROM prices
@@ -268,6 +268,13 @@ def check_ohlc_inconsistency(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         return _empty_flags()
 
     def _describe(row: pd.Series) -> str:
+        """
+        Build a human-readable list of every OHLC constraint this row violates.
+
+        @param row: A row from the query above (open, high, low, close present).
+        @return: A "; "-joined string of each specific violation (a row can fail
+            more than one condition at once).
+        """
         violations = []
         if row["high"] < row["low"]:
             violations.append(f"high ({row['high']:.2f}) < low ({row['low']:.2f})")
@@ -282,6 +289,8 @@ def check_ohlc_inconsistency(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         return "; ".join(violations)
 
     df["flag_type"] = "OHLC_INCONSISTENCY"
+    # HIGH: a violation means the row is corrupted at the source, not reflecting
+    # real market behavior — any calculation built on it will be wrong.
     df["severity"] = "high"
     df["details"] = df.apply(_describe, axis=1)
     return df[_FLAGS_COLUMNS]
@@ -292,10 +301,14 @@ def run_validations(
     stale_price_n: int = 3,
     outlier_k: float = 3.0,
 ) -> pd.DataFrame:
-    """Run all five checks against `prices` and (re)write the `flags` table.
+    """
+    Run all five checks against `prices` and (re)write the `flags` table.
 
-    Drops and recreates `flags` each run so re-running validation doesn't
-    accumulate duplicate flags from previous runs.
+    @param db_path: Path to the DuckDB database file.
+    @param stale_price_n: Streak-length threshold passed through to check_stale_price().
+    @param outlier_k: Std-dev threshold passed through to check_outlier_return().
+    @return: The combined flags DataFrame written to the `flags` table (all
+        five checks concatenated).
     """
     con = duckdb.connect(str(db_path))
     try:
@@ -308,6 +321,8 @@ def run_validations(
         ]
         all_flags = pd.concat(checks, ignore_index=True) if checks else _empty_flags()
 
+        # Drop/recreate rather than append, so re-running validation on the same
+        # data doesn't accumulate duplicate flags from previous runs.
         con.execute("DROP TABLE IF EXISTS flags")
         con.execute(_FLAGS_SCHEMA)
         con.register("new_flags", all_flags)

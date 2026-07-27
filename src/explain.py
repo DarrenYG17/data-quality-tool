@@ -39,7 +39,14 @@ _CANDIDATE_HYPOTHESES = (
 
 
 def load_model_name(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> str:
-    """Read the Claude model name to use for explanations from a JSON config file."""
+    """
+    Read the Claude model name to use for explanations from a JSON config file.
+
+    @param config_path: Path to the JSON config file; must define a `model` string.
+    @return: The model name (e.g. "claude-sonnet-5").
+    @raise FileNotFoundError: if `config_path` does not exist.
+    @raise ValueError: if the config has no (or an empty) `model` field.
+    """
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -55,7 +62,14 @@ def load_model_name(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> str:
 
 
 def get_unexplained_flags(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Find flags with no matching row in `explanations`, via a SQL join."""
+    """
+    Find flags with no matching row in `explanations`.
+
+    @param con: Open DuckDB connection with `flags` and `explanations` tables.
+    @return: DataFrame of flags (ticker, date, flag_type, severity, details)
+        that don't yet have an explanation, via a LEFT JOIN + IS NULL filter
+        (not a per-row Python existence check).
+    """
     query = """
         SELECT f.ticker, f.date, f.flag_type, f.severity, f.details
         FROM flags f
@@ -70,7 +84,20 @@ def get_unexplained_flags(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 def get_price_window(
     con: duckdb.DuckDBPyConnection, ticker: str, date, window: int = 10
 ) -> pd.DataFrame:
-    """Fetch `window` trading days of price/volume history on either side of `date` for `ticker`."""
+    """
+    Fetch `window` trading days of price/volume history on either side of `date` for `ticker`.
+
+    @param con: Open DuckDB connection with a `prices` table.
+    @param ticker: Ticker symbol to fetch history for.
+    @param date: The flagged date to center the window on. Note: if this
+        exact date has no row in `prices` (as is always true for a
+        MISSING_DATES flag), the `target` CTE below finds no rank to anchor
+        on, and this returns an *empty* DataFrame rather than the nearest
+        available days — callers should not assume a non-empty result.
+    @param window: Number of trading days to include on each side of `date`.
+    @return: DataFrame of (date, open, high, low, close, volume, adj_close)
+        rows, ordered chronologically.
+    """
     query = """
         WITH ranked AS (
             SELECT *, ROW_NUMBER() OVER (ORDER BY date) AS rn
@@ -90,7 +117,14 @@ def get_price_window(
 
 
 def build_prompt(flag_row: pd.Series, price_window: pd.DataFrame) -> str:
-    """Build a prompt giving Claude the flag details plus surrounding price/volume context."""
+    """
+    Build the prompt giving Claude the flag details plus surrounding price/volume context.
+
+    @param flag_row: A single row (ticker, date, flag_type, severity, details)
+        from get_unexplained_flags().
+    @param price_window: The corresponding price/volume history from get_price_window().
+    @return: The full prompt string to send to the Claude API.
+    """
     history_lines = "\n".join(
         f"{row.date}  open={row.open:.2f} high={row.high:.2f} low={row.low:.2f} "
         f"close={row.close:.2f} volume={int(row.volume) if pd.notna(row.volume) else 'NA'} "
@@ -116,8 +150,22 @@ Briefly consider what's most likely ({_CANDIDATE_HYPOTHESES}), then state your c
 def explain_flag(
     client: anthropic.Anthropic, model: str, flag_row: pd.Series, price_window: pd.DataFrame
 ) -> str:
-    """Call Claude to generate a narrative explanation for one flagged row."""
+    """
+    Call Claude to generate a narrative explanation for one flagged row.
+
+    @param client: An initialized Anthropic client.
+    @param model: Model name to use for the request (from load_model_name()).
+    @param flag_row: A single row from get_unexplained_flags().
+    @param price_window: The corresponding price/volume history from get_price_window().
+    @return: The plain-text explanation Claude returned.
+    @raise Exception: propagates any error from the Anthropic API call
+        (network, auth, rate limit, etc.) — callers are expected to catch
+        and log per-flag rather than let one failure abort a whole batch.
+    """
     prompt = build_prompt(flag_row, price_window)
+    # Thinking is disabled because this is a short, bounded classification task with
+    # no tools involved — leaving it on would eat into max_tokens invisibly (thinking
+    # + visible text share the same budget) and could truncate the answer.
     response = client.messages.create(
         model=model,
         max_tokens=500,
@@ -131,7 +179,15 @@ def run_explanations(
     db_path: Union[str, Path] = DEFAULT_DB_PATH,
     config_path: Union[str, Path] = DEFAULT_CONFIG_PATH,
 ) -> dict:
-    """Explain all currently-unexplained flags and append results to `explanations`."""
+    """
+    Explain all currently-unexplained flags and append results to `explanations`.
+
+    @param db_path: Path to the DuckDB database file.
+    @param config_path: Path to the JSON config file naming the Claude model to use.
+    @return: dict with keys "newly_explained", "already_cached", and "failed" counts.
+    @raise FileNotFoundError: propagated from load_model_name() if the config is missing.
+    @raise ValueError: propagated from load_model_name() if the config is malformed.
+    """
     model = load_model_name(config_path)
     client = anthropic.Anthropic()
 
@@ -152,6 +208,8 @@ def run_explanations(
             try:
                 explanation = explain_flag(client, model, flag_row, price_window)
             except Exception as exc:
+                # Catch broadly and continue: one flag's API failure (rate limit, auth,
+                # network) should never abort explaining the rest of the batch.
                 logger.error(
                     "Failed to explain %s/%s/%s: %s",
                     flag_row["ticker"], flag_row["date"], flag_row["flag_type"], exc,

@@ -12,7 +12,15 @@ from src.validate import run_validations
 
 
 def verify(db_path: str) -> None:
-    """Print a per-ticker summary of what landed in the prices table."""
+    """
+    Print a per-ticker summary of what landed in the `prices` table.
+
+    @param db_path: Path to the DuckDB database file (opened read-only).
+    @return: None. Prints "No rows found" if `prices` is empty, otherwise a
+        ticker/row-count/date-range table.
+    @raise duckdb.Error: if the connection or query fails (e.g. `prices`
+        table doesn't exist).
+    """
     con = duckdb.connect(db_path, read_only=True)
     try:
         rows = con.execute(
@@ -36,7 +44,12 @@ def verify(db_path: str) -> None:
 
 
 def print_validation_summary(flags_df) -> None:
-    """Print a flag count summary grouped by flag_type and severity."""
+    """
+    Print a flag count summary grouped by flag_type and severity.
+
+    @param flags_df: The flags DataFrame returned by run_validations().
+    @return: None.
+    """
     if flags_df.empty:
         print("\nNo data quality issues detected.")
         return
@@ -52,7 +65,13 @@ def print_validation_summary(flags_df) -> None:
 
 
 def print_explanation_summary(summary: dict) -> None:
-    """Print counts of newly explained vs. already-cached vs. failed flags."""
+    """
+    Print counts of newly explained vs. already-cached vs. failed flags.
+
+    @param summary: The dict returned by run_explanations() (keys
+        "newly_explained", "already_cached", "failed").
+    @return: None.
+    """
     print(
         f"\nNewly explained: {summary['newly_explained']}\n"
         f"Already cached (skipped): {summary['already_cached']}\n"
@@ -61,6 +80,15 @@ def print_explanation_summary(summary: dict) -> None:
 
 
 def main() -> int:
+    """
+    Run the full pipeline: ingest -> verify -> validate -> explain -> report.
+
+    Each stage is wrapped in its own try/except so a failure is attributed
+    to the specific stage that caused it, rather than surfacing as a
+    generic traceback or being mislabeled as an earlier/later stage's error.
+
+    @return: Process exit code (0 on success, 1 if any stage failed).
+    """
     parser = argparse.ArgumentParser(description="Ingest daily OHLCV data into DuckDB.")
     parser.add_argument(
         "--config",
@@ -98,6 +126,9 @@ def main() -> int:
     print_validation_summary(flags_df)
 
     try:
+        # Broad except here: run_explanations() constructs an Anthropic client at
+        # call time, and a missing/invalid API key can raise before any per-flag
+        # error handling (inside run_explanations itself) even gets a chance to run.
         explanation_summary = run_explanations(db_path)
     except Exception as exc:
         print(f"Explanation failed: {exc}", file=sys.stderr)

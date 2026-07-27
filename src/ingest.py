@@ -19,6 +19,8 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "ticke
 class TickerDataUnavailable(RuntimeError):
     """Raised when yfinance returned no usable data for any configured ticker."""
 
+# (ticker, date) is the PRIMARY KEY, which is what makes write_to_duckdb's
+# delete-then-insert pattern behave as an upsert instead of an append.
 _TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS prices (
     ticker TEXT NOT NULL,
@@ -36,10 +38,16 @@ CREATE TABLE IF NOT EXISTS prices (
 
 
 def load_config(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> dict:
-    """Load the ticker list and settings from a JSON config file.
+    """
+    Load and validate the ticker list and pipeline settings from a JSON config file.
 
-    Each entry in `tickers` must be an object with `symbol` and `exchange`
-    fields, e.g. {"symbol": "EZJ.L", "exchange": "LSE"}.
+    @param config_path: Path to the JSON config file. Must define a non-empty
+        `tickers` list, where each entry is an object with `symbol` and
+        `exchange` fields, e.g. {"symbol": "EZJ.L", "exchange": "LSE"}.
+    @return: The parsed config dict (raw JSON structure, unmodified beyond validation).
+    @raise FileNotFoundError: if `config_path` does not exist.
+    @raise ValueError: if `tickers` is missing/empty, or any entry is not an
+        object with both `symbol` and `exchange`.
     """
     path = Path(config_path)
     if not path.exists():
@@ -68,11 +76,24 @@ def fetch_ticker_history(
     max_retries: int = 3,
     backoff_seconds: float = 5.0,
 ) -> Optional[pd.DataFrame]:
-    """Fetch daily OHLCV history for a single ticker, retrying on rate limits or empty responses."""
+    """
+    Fetch daily OHLCV history for a single ticker from yfinance, retrying transient failures.
+
+    @param ticker: The yfinance ticker symbol to fetch (e.g. "EZJ.L").
+    @param period: yfinance lookback window string (e.g. "1mo", "6mo").
+    @param max_retries: Maximum number of attempts before giving up.
+    @param backoff_seconds: Base delay between retries; actual wait grows
+        linearly with the attempt number (attempt 1 waits backoff_seconds,
+        attempt 2 waits 2x, etc.) to ease off during rate limiting.
+    @return: The raw yfinance history DataFrame, or None if every attempt
+        failed or returned no rows.
+    """
     for attempt in range(1, max_retries + 1):
         try:
             history = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
         except Exception as exc:
+            # yfinance can raise on rate limits/network errors; treat like an empty
+            # response so the retry loop below handles it uniformly.
             logger.warning("Attempt %d/%d for %s failed: %s", attempt, max_retries, ticker, exc)
             history = None
 
@@ -92,7 +113,21 @@ def fetch_ticker_history(
 
 
 def normalize_history(symbol: str, exchange: str, history: pd.DataFrame) -> pd.DataFrame:
-    """Reshape a yfinance history DataFrame into the prices table's column layout."""
+    """
+    Reshape a raw yfinance history DataFrame into the `prices` table's column layout.
+
+    @param symbol: Ticker symbol to stamp onto every row (yfinance's
+        per-ticker `history()` response has no ticker column of its own).
+    @param exchange: Exchange code to stamp onto every row (used later by
+        validate.py to pick the right trading calendar).
+    @param history: Raw DataFrame as returned by `yf.Ticker(...).history(...)`,
+        indexed by date with columns like "Open", "Adj Close", etc.
+    @return: A DataFrame with columns exactly
+        [ticker, exchange, date, open, high, low, close, volume, adj_close],
+        ready to insert into `prices`.
+    """
+    # yfinance doesn't always return every OHLCV column (e.g. "Adj Close" can be
+    # absent depending on auto_adjust/version), so only pull what's actually present.
     available = [c for c in ["Open", "High", "Low", "Close", "Volume", "Adj Close"] if c in history.columns]
     df = history.reset_index()[["Date"] + available].copy()
 
@@ -102,10 +137,13 @@ def normalize_history(symbol: str, exchange: str, history: pd.DataFrame) -> pd.D
     }
     df = df.rename(columns=rename_map)
 
+    # Backfill any column yfinance omitted so every row always has all 8 fields,
+    # regardless of what this particular response happened to include.
     for col in ["open", "high", "low", "close", "volume", "adj_close"]:
         if col not in df.columns:
             df[col] = None
 
+    # insert(0, ...) then insert(1, ...) places them in order: ticker, exchange, date, ...
     df.insert(0, "ticker", symbol)
     df.insert(1, "exchange", exchange)
     df["date"] = pd.to_datetime(df["date"]).dt.date
@@ -114,9 +152,17 @@ def normalize_history(symbol: str, exchange: str, history: pd.DataFrame) -> pd.D
 
 
 def fetch_all(tickers: list[dict], period: str = "1mo") -> pd.DataFrame:
-    """Fetch and normalize OHLCV history for all tickers, skipping any that fail entirely.
+    """
+    Fetch and normalize OHLCV history for every configured ticker, tolerating partial failures.
 
-    Each entry in `tickers` is a dict with `symbol` and `exchange` keys.
+    @param tickers: List of dicts, each with `symbol` and `exchange` keys
+        (the validated shape produced by load_config()).
+    @param period: yfinance lookback window string, passed through to
+        fetch_ticker_history() for every ticker.
+    @return: A single concatenated DataFrame covering every ticker that
+        returned data.
+    @raise TickerDataUnavailable: if not a single configured ticker returned
+        any data (a partial failure is only logged as a warning, not raised).
     """
     frames = []
     failed = []
@@ -142,7 +188,14 @@ def fetch_all(tickers: list[dict], period: str = "1mo") -> pd.DataFrame:
 
 
 def write_to_duckdb(df: pd.DataFrame, db_path: Union[str, Path]) -> None:
-    """Create the prices table if needed and upsert rows, replacing any (ticker, date) overlap."""
+    """
+    Create the `prices` table if needed and upsert `df` into it.
+
+    @param df: DataFrame shaped like normalize_history()'s output
+        (ticker, exchange, date, open, high, low, close, volume, adj_close).
+    @param db_path: Path to the DuckDB database file (created if it doesn't exist).
+    @return: None. Writes directly to the database file.
+    """
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -150,6 +203,9 @@ def write_to_duckdb(df: pd.DataFrame, db_path: Union[str, Path]) -> None:
     try:
         con.execute(_TABLE_SCHEMA)
         con.register("new_prices", df)
+        # Delete any existing rows that overlap with what we're about to insert, so
+        # re-ingesting the same ticker/date range replaces stale data instead of
+        # violating the (ticker, date) PRIMARY KEY or duplicating rows.
         con.execute(
             "DELETE FROM prices WHERE (ticker, date) IN (SELECT ticker, date FROM new_prices)"
         )
@@ -159,6 +215,15 @@ def write_to_duckdb(df: pd.DataFrame, db_path: Union[str, Path]) -> None:
 
 
 def run(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> None:
+    """
+    Load config, fetch every configured ticker, and write the results to DuckDB.
+
+    @param config_path: Path to the ticker config JSON file.
+    @return: None. Logs a summary of rows/tickers written on success.
+    @raise FileNotFoundError: propagated from load_config() if the config is missing.
+    @raise ValueError: propagated from load_config() if the config is malformed.
+    @raise TickerDataUnavailable: propagated from fetch_all() if no ticker returned data.
+    """
     config = load_config(config_path)
     tickers = config["tickers"]
     db_path = config.get("db_path", "data/market_data.duckdb")

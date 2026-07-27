@@ -21,7 +21,12 @@ _NO_EXPLANATION_NOTE = "No explanation available"
 
 
 def _build_summary_section(con: duckdb.DuckDBPyConnection) -> str:
-    """Date range, tickers covered, total row count, and a flag-count table."""
+    """
+    Build the report's summary section: date range, tickers, row count, and flag-count table.
+
+    @param con: Open DuckDB connection with `prices` and `flags` tables.
+    @return: Markdown string for the "## Summary" section.
+    """
     min_date, max_date, total_rows = con.execute(
         "SELECT MIN(date), MAX(date), COUNT(*) FROM prices"
     ).fetchone()
@@ -59,7 +64,16 @@ def _build_summary_section(con: duckdb.DuckDBPyConnection) -> str:
 
 
 def _build_ticker_sections(con: duckdb.DuckDBPyConnection) -> str:
-    """One section per ticker, listing its flags in chronological order with explanations."""
+    """
+    Build one markdown section per ticker, listing its flags in chronological order.
+
+    @param con: Open DuckDB connection with `prices`, `flags`, and `explanations` tables.
+    @return: Markdown string covering every ticker present in `prices`
+        (including those with zero flags, which get a short placeholder line).
+        Each flag shows its `details` plus the matching `explanations` text if
+        one exists; otherwise a fallback note (the market-holiday note for
+        MISSING_DATES, a generic "no explanation" note otherwise).
+    """
     tickers = con.execute("SELECT DISTINCT ticker FROM prices ORDER BY ticker").fetchdf()["ticker"].tolist()
 
     lines = []
@@ -90,6 +104,10 @@ def _build_ticker_sections(con: duckdb.DuckDBPyConnection) -> str:
             if pd.notna(row.explanation):
                 lines.append(f"- Explanation: {row.explanation}")
             elif row.flag_type == "MISSING_DATES":
+                # MISSING_DATES flags are the common case with no LLM explanation: the
+                # calendar-driven check already screens out holidays before flagging,
+                # so a note is more honest than forcing an LLM call with no price data
+                # to reason over (see get_price_window()'s docstring in explain.py).
                 lines.append(f"- Explanation: {_HOLIDAY_NOTE}")
             else:
                 lines.append(f"- Explanation: {_NO_EXPLANATION_NOTE}")
@@ -99,7 +117,13 @@ def _build_ticker_sections(con: duckdb.DuckDBPyConnection) -> str:
 
 
 def _build_pass_rate_section(con: duckdb.DuckDBPyConnection) -> str:
-    """What percentage of (ticker, date) rows in `prices` had zero flags at all."""
+    """
+    Build the closing section stating what percentage of rows had zero flags.
+
+    @param con: Open DuckDB connection with `prices` and `flags` tables.
+    @return: Markdown string for the "## Result" section, framed positively
+        (percentage that passed, not percentage that failed).
+    """
     total_rows = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
     flagged_rows = con.execute(
         "SELECT COUNT(*) FROM (SELECT DISTINCT ticker, date FROM flags)"
@@ -111,7 +135,13 @@ def _build_pass_rate_section(con: duckdb.DuckDBPyConnection) -> str:
 
 
 def build_report(db_path: Union[str, Path] = DEFAULT_DB_PATH) -> str:
-    """Assemble the full markdown report from the DuckDB database."""
+    """
+    Assemble the full markdown report from the DuckDB database.
+
+    @param db_path: Path to the DuckDB database file (opened read-only).
+    @return: The complete report as a single markdown string (title +
+        summary + per-ticker sections + pass-rate result).
+    """
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         sections = [
@@ -128,19 +158,28 @@ def build_report(db_path: Union[str, Path] = DEFAULT_DB_PATH) -> str:
 
 
 def save_report(report: str, path: Union[str, Path]) -> None:
-    """Write the markdown report string to `path`, creating parent directories as needed."""
+    """
+    Write the markdown report string to disk.
+
+    @param report: The report text to write (typically build_report()'s output).
+    @param path: Destination file path; parent directories are created as needed.
+    @return: None.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report, encoding="utf-8")
 
 
 def _ticker_date_range_hash(con: duckdb.DuckDBPyConnection) -> str:
-    """Short hash derived from the ticker set and date range covered by `prices`.
+    """
+    Compute a short hash identifying the ticker set and date range covered by `prices`.
 
-    Two reports covering the same tickers and date range hash identically
-    (and share a filename, so an identical rerun just overwrites); a
-    different scope (different tickers or date range) hashes differently,
-    so those reports get distinct filenames instead of colliding.
+    @param con: Open DuckDB connection with a `prices` table.
+    @return: An 8-character hex hash. Two databases covering the same tickers
+        and date range hash identically (so a rerun overwrites the same
+        filename); a different scope (different tickers or date range)
+        hashes differently, avoiding filename collisions between distinct
+        reports generated on the same day.
     """
     tickers = con.execute("SELECT DISTINCT ticker FROM prices ORDER BY ticker").fetchdf()["ticker"].tolist()
     min_date, max_date = con.execute("SELECT MIN(date), MAX(date) FROM prices").fetchone()
@@ -152,7 +191,14 @@ def default_report_filename(
     db_path: Union[str, Path] = DEFAULT_DB_PATH,
     report_date: Optional[date] = None,
 ) -> str:
-    """Build the default report filename: market_data_quality_report_<date>_<hash>.md."""
+    """
+    Build the default report filename for a given database's current scope.
+
+    @param db_path: Path to the DuckDB database file (opened read-only to
+        compute the content hash).
+    @param report_date: Date to embed in the filename; defaults to today.
+    @return: Filename of the form "market_data_quality_report_<date>_<hash>.md".
+    """
     report_date = report_date or date.today()
     con = duckdb.connect(str(db_path), read_only=True)
     try:
