@@ -22,6 +22,7 @@ class TickerDataUnavailable(RuntimeError):
 _TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS prices (
     ticker TEXT NOT NULL,
+    exchange TEXT NOT NULL,
     date DATE NOT NULL,
     open DOUBLE,
     high DOUBLE,
@@ -35,7 +36,11 @@ CREATE TABLE IF NOT EXISTS prices (
 
 
 def load_config(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> dict:
-    """Load the ticker list and settings from a JSON config file."""
+    """Load the ticker list and settings from a JSON config file.
+
+    Each entry in `tickers` must be an object with `symbol` and `exchange`
+    fields, e.g. {"symbol": "EZJ.L", "exchange": "LSE"}.
+    """
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -43,8 +48,16 @@ def load_config(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> dict:
     with path.open("r", encoding="utf-8") as f:
         config = json.load(f)
 
-    if not config.get("tickers"):
+    tickers = config.get("tickers")
+    if not tickers:
         raise ValueError(f"Config file {path} must define a non-empty 'tickers' list.")
+
+    for entry in tickers:
+        if not isinstance(entry, dict) or "symbol" not in entry or "exchange" not in entry:
+            raise ValueError(
+                f"Config file {path}: each ticker must be an object with 'symbol' and "
+                f"'exchange' fields, got {entry!r}."
+            )
 
     return config
 
@@ -78,7 +91,7 @@ def fetch_ticker_history(
     return None
 
 
-def normalize_history(ticker: str, history: pd.DataFrame) -> pd.DataFrame:
+def normalize_history(symbol: str, exchange: str, history: pd.DataFrame) -> pd.DataFrame:
     """Reshape a yfinance history DataFrame into the prices table's column layout."""
     available = [c for c in ["Open", "High", "Low", "Close", "Volume", "Adj Close"] if c in history.columns]
     df = history.reset_index()[["Date"] + available].copy()
@@ -93,23 +106,29 @@ def normalize_history(ticker: str, history: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = None
 
-    df.insert(0, "ticker", ticker)
+    df.insert(0, "ticker", symbol)
+    df.insert(1, "exchange", exchange)
     df["date"] = pd.to_datetime(df["date"]).dt.date
 
-    return df[["ticker", "date", "open", "high", "low", "close", "volume", "adj_close"]]
+    return df[["ticker", "exchange", "date", "open", "high", "low", "close", "volume", "adj_close"]]
 
 
-def fetch_all(tickers: list[str], period: str = "1mo") -> pd.DataFrame:
-    """Fetch and normalize OHLCV history for all tickers, skipping any that fail entirely."""
+def fetch_all(tickers: list[dict], period: str = "1mo") -> pd.DataFrame:
+    """Fetch and normalize OHLCV history for all tickers, skipping any that fail entirely.
+
+    Each entry in `tickers` is a dict with `symbol` and `exchange` keys.
+    """
     frames = []
     failed = []
 
-    for ticker in tickers:
-        history = fetch_ticker_history(ticker, period=period)
+    for entry in tickers:
+        symbol = entry["symbol"]
+        exchange = entry["exchange"]
+        history = fetch_ticker_history(symbol, period=period)
         if history is None:
-            failed.append(ticker)
+            failed.append(symbol)
             continue
-        frames.append(normalize_history(ticker, history))
+        frames.append(normalize_history(symbol, exchange, history))
 
     if failed:
         logger.warning("No data retrieved for %d ticker(s): %s", len(failed), ", ".join(failed))

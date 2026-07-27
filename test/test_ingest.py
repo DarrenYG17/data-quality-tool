@@ -66,8 +66,13 @@ class TestIngest:
             adj_closes=[50.1, 51.1, 52.1, 53.1, 54.1],
         )
 
+        tickers = [
+            {"symbol": "AAA", "exchange": "NYSE"},
+            {"symbol": "BBB", "exchange": "LSE"},
+        ]
+
         with _patch_ticker({"AAA": aaa_hist, "BBB": bbb_hist}):
-            df = ingest.fetch_all(["AAA", "BBB"], period="5d")
+            df = ingest.fetch_all(tickers, period="5d")
 
         db_path = tmp_path / "market.duckdb"
         ingest.write_to_duckdb(df, db_path)
@@ -80,15 +85,17 @@ class TestIngest:
 
         assert len(result) == 10
         assert list(result.columns) == [
-            "ticker", "date", "open", "high", "low", "close", "volume", "adj_close",
+            "ticker", "exchange", "date", "open", "high", "low", "close", "volume", "adj_close",
         ]
 
         aaa_first = result[result["ticker"] == "AAA"].iloc[0]
+        assert aaa_first["exchange"] == "NYSE"
         assert aaa_first["open"] == pytest.approx(10.0)
         assert aaa_first["close"] == pytest.approx(10.2)
         assert aaa_first["volume"] == 1000
 
         bbb_last = result[result["ticker"] == "BBB"].iloc[-1]
+        assert bbb_last["exchange"] == "LSE"
         assert bbb_last["adj_close"] == pytest.approx(54.1)
 
     def test_ingest_handles_missing_values(self, tmp_path):
@@ -105,7 +112,7 @@ class TestIngest:
         )
 
         with _patch_ticker({"AAA": aaa_hist}):
-            df = ingest.fetch_all(["AAA"], period="5d")
+            df = ingest.fetch_all([{"symbol": "AAA", "exchange": "NYSE"}], period="5d")
 
         db_path = tmp_path / "market.duckdb"
         ingest.write_to_duckdb(df, db_path)
@@ -134,7 +141,7 @@ class TestIngest:
 
         with _patch_ticker({"XXX": empty_hist}):
             with pytest.raises(ingest.TickerDataUnavailable, match="XXX"):
-                ingest.fetch_all(["XXX"], period="5d")
+                ingest.fetch_all([{"symbol": "XXX", "exchange": "NYSE"}], period="5d")
 
     def test_ingest_rerun_does_not_duplicate(self, tmp_path):
         """Running ingest twice with the same data/date range must not duplicate (ticker, date) rows."""
@@ -158,11 +165,15 @@ class TestIngest:
             adj_closes=[50.1, 51.1, 52.1, 53.1, 54.1],
         )
 
+        tickers = [
+            {"symbol": "AAA", "exchange": "NYSE"},
+            {"symbol": "BBB", "exchange": "LSE"},
+        ]
         db_path = tmp_path / "market.duckdb"
 
         with _patch_ticker({"AAA": aaa_hist, "BBB": bbb_hist}):
-            ingest.write_to_duckdb(ingest.fetch_all(["AAA", "BBB"], period="5d"), db_path)
-            ingest.write_to_duckdb(ingest.fetch_all(["AAA", "BBB"], period="5d"), db_path)
+            ingest.write_to_duckdb(ingest.fetch_all(tickers, period="5d"), db_path)
+            ingest.write_to_duckdb(ingest.fetch_all(tickers, period="5d"), db_path)
 
         con = duckdb.connect(str(db_path))
         try:

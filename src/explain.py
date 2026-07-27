@@ -32,12 +32,10 @@ CREATE TABLE IF NOT EXISTS explanations (
 )
 """
 
-_CANDIDATE_HYPOTHESES = """\
-- A genuine market move (news, earnings, sector-wide event affecting airline/travel stocks)
-- An unadjusted stock split or dividend
-- A data provider glitch (bad print, wrong field, duplicate pull from yfinance)
-- A stale or duplicate data artifact (e.g. repeated last-known price)\
-"""
+_CANDIDATE_HYPOTHESES = (
+    "a genuine market move, an unadjusted stock split or dividend, "
+    "a data provider glitch, or a stale/duplicate data artifact"
+)
 
 
 def load_model_name(config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> str:
@@ -112,12 +110,7 @@ Here is the surrounding trading-day price/volume history for this ticker (roughl
 
 {history_lines}
 
-Briefly weigh these candidate explanations against the data above:
-{_CANDIDATE_HYPOTHESES}
-
-Then commit to the single hypothesis you find most likely and explain why.
-
-Respond in plain prose only: no markdown, no bold text, no bullet points, no headers. Write 2-4 sentences as a single flowing paragraph — state your reasoning briefly, then your conclusion, in ordinary sentences."""
+Briefly consider what's most likely ({_CANDIDATE_HYPOTHESES}), then state your conclusion in 2-3 sentences total. Do not address every hypothesis individually — just reach and justify your best explanation, in plain prose with no markdown, bold text, bullet points, or headers."""
 
 
 def explain_flag(
@@ -131,7 +124,6 @@ def explain_flag(
         thinking={"type": "disabled"},
         messages=[{"role": "user", "content": prompt}],
     )
-    print(response.stop_reason)
     return next(block.text for block in response.content if block.type == "text")
 
 

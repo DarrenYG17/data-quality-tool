@@ -13,6 +13,7 @@ from typing import Union
 
 import duckdb
 import pandas as pd
+import pandas_market_calendars as mcal
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "market_data.duckdb"
 
@@ -34,45 +35,61 @@ def _empty_flags() -> pd.DataFrame:
 
 
 def check_missing_dates(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Flag expected trading weekdays with no price row at all.
+    """Flag expected trading days with no price row at all.
 
-    For each ticker, builds the full weekday calendar between its min and
-    max date and left-joins it against `prices` to find gaps.
+    For each ticker, looks up its own exchange's trading calendar (via
+    pandas_market_calendars) and computes the actual trading days between
+    that ticker's min and max date in `prices`, then flags any of those
+    days with no matching row. A date that wasn't a trading day for the
+    ticker's exchange (weekend or market holiday) is never flagged.
 
-    Why it matters: a missing weekday is usually either a market holiday
-    (benign) or an incomplete/broken data pull for that day (not benign).
-    Either way it's a hole in the time series that will silently distort
-    anything computed over "all trading days" (rolling averages, return
-    series, etc.) unless it's accounted for. Severity defaults to LOW
-    because most gaps turn out to be routine holidays rather than pipeline
-    failures — this check is about visibility, not alarm.
+    Why it matters: a missing trading day is an incomplete/broken data
+    pull, not a benign calendar artifact — unlike a naive "every weekday"
+    check, this won't misflag real market holidays as gaps. Severity
+    defaults to LOW since a single missed day is rarely a crisis, but it's
+    still a hole that will silently distort anything computed over "all
+    trading days" (rolling averages, return series, etc.) unless it's
+    accounted for.
     """
-    query = """
-        WITH ticker_bounds AS (
-            SELECT ticker, MIN(date) AS min_date, MAX(date) AS max_date
-            FROM prices
-            GROUP BY ticker
-        ),
-        expected_dates AS (
-            SELECT b.ticker, gs.d::DATE AS date
-            FROM ticker_bounds b,
-                 generate_series(b.min_date::TIMESTAMP, b.max_date::TIMESTAMP, INTERVAL 1 DAY) AS gs(d)
-            WHERE isodow(gs.d::DATE) NOT IN (6, 7)
-        )
-        SELECT e.ticker, e.date
-        FROM expected_dates e
-        LEFT JOIN prices p ON p.ticker = e.ticker AND p.date = e.date
-        WHERE p.date IS NULL
-        ORDER BY e.ticker, e.date
-    """
-    df = con.execute(query).fetchdf()
-    if df.empty:
+    ticker_bounds = con.execute(
+        """
+        SELECT ticker, ANY_VALUE(exchange) AS exchange, MIN(date) AS min_date, MAX(date) AS max_date
+        FROM prices
+        GROUP BY ticker
+        """
+    ).fetchdf()
+
+    if ticker_bounds.empty:
         return _empty_flags()
 
+    existing_dates = con.execute("SELECT ticker, date FROM prices").fetchdf()
+    existing_by_ticker = {
+        ticker: set(pd.to_datetime(group["date"]).dt.date)
+        for ticker, group in existing_dates.groupby("ticker")
+    }
+
+    rows = []
+    for row in ticker_bounds.itertuples():
+        calendar = mcal.get_calendar(row.exchange)
+        trading_days = calendar.valid_days(start_date=row.min_date, end_date=row.max_date)
+        expected_dates = {ts.date() for ts in trading_days}
+
+        actual_dates = existing_by_ticker.get(row.ticker, set())
+        for missing_date in sorted(expected_dates - actual_dates):
+            rows.append({"ticker": row.ticker, "date": missing_date})
+
+    if not rows:
+        return _empty_flags()
+
+    df = pd.DataFrame(rows).sort_values(["ticker", "date"]).reset_index(drop=True)
+    # Normalize to pd.Timestamp so this check's `date` column matches the dtype
+    # the other (SQL-driven) checks produce via fetchdf() — otherwise pd.concat
+    # in run_validations() ends up with a mixed-type object column.
+    df["date"] = pd.to_datetime(df["date"])
     df["flag_type"] = "MISSING_DATES"
     df["severity"] = "low"
     df["details"] = df["date"].apply(
-        lambda d: f"No price row found for expected trading weekday {d}."
+        lambda d: f"No price row found for expected trading day {d.date()}."
     )
     return df[_FLAGS_COLUMNS]
 
@@ -195,6 +212,12 @@ def check_outlier_return(con: duckdb.DuckDBPyConnection, k: float = 3.0) -> pd.D
 
 def check_duplicate_rows(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """Flag (ticker, date) combinations that appear more than once in `prices`.
+
+    Note: with the current ingest.py, `prices` has a PRIMARY KEY (ticker,
+    date) constraint, so a true duplicate can never actually be inserted —
+    this check is effectively unreachable against data written by
+    write_to_duckdb(). It's kept as a safeguard in case `prices` is ever
+    populated by another path that doesn't enforce that constraint.
 
     Why it matters: this table should have exactly one row per ticker per
     trading day. Duplicates usually mean the ingestion job re-ran without

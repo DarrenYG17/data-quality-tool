@@ -13,6 +13,7 @@ from itertools import cycle
 
 import duckdb
 import pandas as pd
+import pandas_market_calendars as mcal
 
 from src.validate import (
     check_duplicate_rows,
@@ -22,12 +23,16 @@ from src.validate import (
     check_stale_price,
 )
 
-_COLUMNS = ["ticker", "date", "open", "high", "low", "close", "volume", "adj_close"]
+_COLUMNS = ["ticker", "exchange", "date", "open", "high", "low", "close", "volume", "adj_close"]
 
 
-def _make_prices_df(rows: list[dict]) -> pd.DataFrame:
-    """Build a prices-shaped DataFrame from a list of row dicts."""
-    return pd.DataFrame(rows)[_COLUMNS]
+def _make_prices_df(rows: list[dict], exchange: str = "NYSE") -> pd.DataFrame:
+    """Build a prices-shaped DataFrame from a list of row dicts. Rows without an
+    explicit 'exchange' key default to `exchange`."""
+    df = pd.DataFrame(rows)
+    if "exchange" not in df.columns:
+        df["exchange"] = exchange
+    return df[_COLUMNS]
 
 
 def _run_check(check_fn, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
@@ -37,7 +42,7 @@ def _run_check(check_fn, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         con.execute(
             """
             CREATE TABLE prices (
-                ticker VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE,
+                ticker VARCHAR, exchange VARCHAR, date DATE, open DOUBLE, high DOUBLE, low DOUBLE,
                 close DOUBLE, volume BIGINT, adj_close DOUBLE
             )
             """
@@ -60,6 +65,13 @@ def _weekdays(start: date, count: int) -> list[date]:
     return days
 
 
+def _trading_days(exchange: str, start: date, end: date) -> list[date]:
+    """Return actual trading days for `exchange` between start and end, via pandas_market_calendars."""
+    calendar = mcal.get_calendar(exchange)
+    schedule = calendar.valid_days(start_date=start, end_date=end)
+    return [ts.date() for ts in schedule]
+
+
 def _prices_from_returns(start_price: float, pct_returns: list[float]) -> list[float]:
     """Compound a list of percentage returns onto a starting price."""
     prices = []
@@ -76,11 +88,11 @@ class TestValidateChecks:
     # ---------- MISSING_DATES ----------
 
     def test_missing_dates_clean(self):
-        """A run of consecutive weekdays with no gaps should produce zero MISSING_DATES flags."""
-        days = _weekdays(date(2026, 1, 5), 8)
+        """A run of consecutive real NYSE trading days with no gaps should produce zero MISSING_DATES flags."""
+        days = _trading_days("NYSE", date(2026, 1, 5), date(2026, 2, 15))[:8]
         rows = [
-            {"ticker": "AAA", "date": d, "open": 10, "high": 11, "low": 9, "close": 10 + i,
-             "volume": 1000, "adj_close": 10 + i}
+            {"ticker": "AAA", "exchange": "NYSE", "date": d, "open": 10, "high": 11, "low": 9,
+             "close": 10 + i, "volume": 1000, "adj_close": 10 + i}
             for i, d in enumerate(days)
         ]
         df = _make_prices_df(rows)
@@ -90,13 +102,13 @@ class TestValidateChecks:
         assert result.empty
 
     def test_missing_dates_dirty(self):
-        """Removing one weekday from the middle of the range should flag exactly that date."""
-        days = _weekdays(date(2026, 1, 5), 8)
+        """Removing one real trading day from the middle of the range should flag exactly that date."""
+        days = _trading_days("NYSE", date(2026, 1, 5), date(2026, 2, 15))[:8]
         missing_day = days[3]
         remaining_days = [d for d in days if d != missing_day]
         rows = [
-            {"ticker": "AAA", "date": d, "open": 10, "high": 11, "low": 9, "close": 10 + i,
-             "volume": 1000, "adj_close": 10 + i}
+            {"ticker": "AAA", "exchange": "NYSE", "date": d, "open": 10, "high": 11, "low": 9,
+             "close": 10 + i, "volume": 1000, "adj_close": 10 + i}
             for i, d in enumerate(remaining_days)
         ]
         df = _make_prices_df(rows)
@@ -108,6 +120,24 @@ class TestValidateChecks:
         assert result.iloc[0]["date"] == pd.Timestamp(missing_day)
         assert result.iloc[0]["flag_type"] == "MISSING_DATES"
         assert result.iloc[0]["severity"] == "low"
+
+    def test_missing_dates_never_flags_a_holiday(self):
+        """A US market holiday within the range (no row exists for it) must never be flagged as missing."""
+        # 2026-01-19 is Martin Luther King Jr. Day (NYSE closed) — deliberately excluded from `days`,
+        # but also must not appear in the check's own expected-trading-day set.
+        days = _trading_days("NYSE", date(2026, 1, 5), date(2026, 1, 23))
+        assert date(2026, 1, 19) not in days  # sanity-check our own assumption about the holiday
+
+        rows = [
+            {"ticker": "AAA", "exchange": "NYSE", "date": d, "open": 10, "high": 11, "low": 9,
+             "close": 10 + i, "volume": 1000, "adj_close": 10 + i}
+            for i, d in enumerate(days)
+        ]
+        df = _make_prices_df(rows)
+
+        result = _run_check(check_missing_dates, df)
+
+        assert result.empty
 
     # ---------- STALE_PRICE ----------
 

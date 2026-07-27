@@ -3,3 +3,4 @@ yfinance
 duckdb
 pytest
 anthropic
+pandas_market_calendars

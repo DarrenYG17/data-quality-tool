@@ -1,5 +1,10 @@
 {
-  "tickers": ["EZJ.L", "RYAAY", "JET2.L", "WIZZ.L"],
+  "tickers": [
+    { "symbol": "EZJ.L", "exchange": "LSE" },
+    { "symbol": "RYAAY", "exchange": "NYSE" },
+    { "symbol": "JET2.L", "exchange": "LSE" },
+    { "symbol": "WIZZ.L", "exchange": "LSE" }
+  ],
   "db_path": "data/market_data.duckdb",
   "period": "6mo"
 }

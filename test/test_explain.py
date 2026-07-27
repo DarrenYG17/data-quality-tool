@@ -42,10 +42,11 @@ def _weekdays(start: date, count: int) -> list[date]:
     return days
 
 
-def _make_prices(ticker: str, days: list[date], base_price: float) -> pd.DataFrame:
+def _make_prices(ticker: str, days: list[date], base_price: float, exchange: str = "NYSE") -> pd.DataFrame:
     rows = [
         {
             "ticker": ticker,
+            "exchange": exchange,
             "date": d,
             "open": base_price + i,
             "high": base_price + i + 1,
@@ -56,7 +57,9 @@ def _make_prices(ticker: str, days: list[date], base_price: float) -> pd.DataFra
         }
         for i, d in enumerate(days)
     ]
-    return pd.DataFrame(rows)[["ticker", "date", "open", "high", "low", "close", "volume", "adj_close"]]
+    return pd.DataFrame(rows)[
+        ["ticker", "exchange", "date", "open", "high", "low", "close", "volume", "adj_close"]
+    ]
 
 
 def _mock_anthropic_client(reply_text: str = "mocked explanation") -> MagicMock:
