@@ -205,3 +205,10 @@ pip-selfcheck.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,venv,python
+
+### DuckDB ###
+*.duckdb
+*.duckdb.wal
+
+### Claude Code ###
+.claude/settings.local.json
